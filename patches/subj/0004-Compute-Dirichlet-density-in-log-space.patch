@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 21:14:20 +0000
+Subject: [PATCH 4/8] Compute Dirichlet density in log space
+
+The density multiplied gamma function values directly, which overflows
+double precision as soon as the strength exceeds ~171 (e.g. a binomial
+opinion with u = 0.005), yielding inf / inf = NaN. Evaluate the density
+via lgamma and log instead. The result is mathematically unchanged.
+
+Also take the strength from strengthMat() instead of mapping the data
+of two temporary std::vector copies.
+---
+ src/DirichletPDF.cpp | 24 ++++++++++--------------
+ 1 file changed, 10 insertions(+), 14 deletions(-)
+
+diff --git a/src/DirichletPDF.cpp b/src/DirichletPDF.cpp
+index 38435f3..e03c91d 100644
+--- a/src/DirichletPDF.cpp
++++ b/src/DirichletPDF.cpp
+@@ -134,24 +134,20 @@ double DirichletPDF::density(const std::vector<double>& x) const
+ double DirichletPDF::density(const Eigen::Matrix<double, Eigen::Dynamic, 1>& x) const
+ {
+   // TODO check size?
+-  Eigen::Matrix<double, Eigen::Dynamic, 1> alpha = Eigen::Map<Eigen::VectorXd, Eigen::Unaligned>(
+-    strength().data(), (Eigen::Index)strength().size());
++  Eigen::VectorXd alpha = strengthMat();
+ 
+-  double gamma_prod = 1.0;
+-  for (int i = 0; i < x.rows(); ++i)
++  // Evaluate in log space, as the gamma functions overflow for strong evidence
++  double log_density = std::lgamma(alpha.sum());
++  for (Eigen::Index i = 0; i < x.rows(); ++i)
+   {
+-    gamma_prod =
+-      gamma_prod * static_cast<double>(std::tgammal(alpha(i))); // TODO handle loss of precision
++    log_density -= std::lgamma(alpha(i));
++    if (alpha(i) != 1.0)
++    {
++      log_density += (alpha(i) - 1.0) * std::log(x(i));
++    }
+   }
+ 
+-  double pow_prod = 1.0;
+-  for (int i = 0; i < x.rows(); ++i)
+-  {
+-    pow_prod = pow_prod * std::pow(x(i), alpha(i) - 1.0);
+-  }
+-
+-  return (static_cast<double>(std::tgammal(alpha.sum())) / gamma_prod) *
+-         pow_prod; // TODO handle loss of precision
++  return std::exp(log_density);
+ }
+ 
+ std::ostream& operator<<(std::ostream& os, const DirichletPDF& pdf)

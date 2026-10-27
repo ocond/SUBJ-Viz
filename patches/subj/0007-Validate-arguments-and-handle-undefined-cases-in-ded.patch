@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 21:16:53 +0000
+Subject: [PATCH 7/8] Validate arguments and handle undefined cases in
+ deduction
+
+* Throw std::invalid_argument if no conditionals are given, if their
+  number does not match the antecedent's dimension, or if they differ
+  in dimension. Previously these cases read out of bounds and silently
+  returned garbage.
+* The marginal base rate (MBR) is undefined (0 / 0) if all
+  conditionals of antecedent values with a base rate are vacuous. Fall
+  back to the conditionals' base rates weighted by the antecedent base
+  rate, which yields the vacuous deduced opinion instead of NaN.
+* Skip consequent values with an MBR of zero when computing the
+  sub-simplex apex uncertainty. Their candidate (P - b_min) / a_y is
+  0 / 0 = NaN and minCoeff() returned NaN or not depending on the
+  position of that value.
+---
+ src/Operators.cpp | 54 +++++++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 45 insertions(+), 9 deletions(-)
+
+diff --git a/src/Operators.cpp b/src/Operators.cpp
+index 201138d..952ba8a 100644
+--- a/src/Operators.cpp
++++ b/src/Operators.cpp
+@@ -372,9 +372,31 @@ MultinomialOpinion normalMultiplication(const MultinomialOpinion& opinion1,
+ MultinomialOpinion deduction(const MultinomialOpinion& opinion,
+                              const std::vector<MultinomialOpinion>& conditionalOpinions)
+ {
+-  size_t size        = conditionalOpinions.size();
++  size_t size = conditionalOpinions.size();
++
++  if (size == 0)
++  {
++    throw std::invalid_argument("At least 1 conditional opinion must be given!");
++  }
++
++  if (opinion.dim() < 0 || static_cast<size_t>(opinion.dim()) != size)
++  {
++    throw std::invalid_argument(
++      "The number of conditional opinions must match the dimension of the opinion!");
++  }
++
+   Eigen::Index y_dim = conditionalOpinions[0].dim();
++
++  for (const MultinomialOpinion& o : conditionalOpinions)
++  {
++    if (o.dim() != y_dim)
++    {
++      throw std::invalid_argument("All conditional opinions must have the same dimensions!");
++    }
++  }
++
+   MultinomialOpinion result(y_dim);
++  Eigen::VectorXd a_x = opinion.baseRateMat();
+ 
+   // MBR
+   Eigen::VectorXd a_y     = Eigen::VectorXd::Zero(y_dim);
+@@ -383,21 +405,32 @@ MultinomialOpinion deduction(const MultinomialOpinion& opinion,
+ 
+   for (size_t i = 0; i < size; ++i)
+   {
+-    double a_xi = opinion.baseRate()[i];
++    double a_xi = a_x[static_cast<Eigen::Index>(i)];
+     a_b_sum += a_xi * conditionalOpinions[i].beliefMat();
+     a_u_sum += a_xi * conditionalOpinions[i].uncertainty();
+   }
+ 
+-  a_y = a_b_sum / (1.0 - a_u_sum);
++  if (1.0 - a_u_sum > kUncertaintyEpsilon)
++  {
++    a_y = a_b_sum / (1.0 - a_u_sum);
++  }
++  else
++  {
++    // All conditionals of antecedent values with a base rate are vacuous, so they carry no
++    // evidence about the marginal base rate. Use their base rates instead.
++    for (size_t i = 0; i < size; ++i)
++    {
++      a_y += a_x[static_cast<Eigen::Index>(i)] * conditionalOpinions[i].baseRateMat();
++    }
++  }
+ 
+   // Sub-Simplex Apex Uncertainty
+-  Eigen::VectorXd u_j     = Eigen::VectorXd::Zero(y_dim);
+   Eigen::VectorXd p_yxhat = Eigen::VectorXd::Zero(y_dim);
+   Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> b_yx(size, y_dim);
+ 
+   for (size_t i = 0; i < size; ++i)
+   {
+-    double a_xi               = opinion.baseRate()[i];
++    double a_xi               = a_x[static_cast<Eigen::Index>(i)];
+     MultinomialOpinion condOp = conditionalOpinions[i];
+     condOp.updateBaseRate(a_y);
+     p_yxhat += a_xi * condOp.pMat();
+@@ -405,14 +438,17 @@ MultinomialOpinion deduction(const MultinomialOpinion& opinion,
+     b_yx.block(i, 0, 1, y_dim) = conditionalOpinions[i].beliefMat().transpose();
+   }
+ 
++  // Components without base rate do not constrain the apex uncertainty, which can be at most 1
+   Eigen::VectorXd b_yx_column_min = b_yx.colwise().minCoeff();
+-  for (size_t j = 0; j < static_cast<size_t>(y_dim); ++j)
++  double u_yxhat                  = 1.0;
++  for (Eigen::Index j = 0; j < y_dim; ++j)
+   {
+-    u_j[j] = (p_yxhat[j] - b_yx_column_min[j]) / a_y[j];
++    if (a_y[j] > 0.0)
++    {
++      u_yxhat = std::min(u_yxhat, (p_yxhat[j] - b_yx_column_min[j]) / a_y[j]);
++    }
+   }
+ 
+-  double u_yxhat = u_j.minCoeff();
+-
+   double u_yxibxi_sum = 0.0;
+ 
+   for (size_t i = 0; i < size; ++i)

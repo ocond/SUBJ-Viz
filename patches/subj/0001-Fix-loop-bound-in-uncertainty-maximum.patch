@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 21:13:27 +0000
+Subject: [PATCH 1/8] Fix loop bound in uncertainty maximum
+
+The loop iterated while i < Eigen::Dynamic, which is -1, so the loop
+body never ran and uncertaintyMaximum() always returned 1.0. Iterate
+over the opinion's dimensions instead and skip states with a zero base
+rate, which do not constrain the maximum uncertainty.
+---
+ src/MultinomialOpinion.cpp | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/MultinomialOpinion.cpp b/src/MultinomialOpinion.cpp
+index b3b1723..a5288ad 100644
+--- a/src/MultinomialOpinion.cpp
++++ b/src/MultinomialOpinion.cpp
+@@ -390,8 +390,13 @@ double MultinomialOpinion::uncertaintyMaximum() const
+   double min_u                 = 1.0;
+   MultinomialOpinion::Vector p = projectionMat();
+ 
+-  for (int i = 0; i < Eigen::Dynamic; ++i)
++  for (Eigen::Index i = 0; i < m_dim; ++i)
+   {
++    // States without base rate do not constrain the uncertainty
++    if (m_base_rate(i) <= 0.0)
++    {
++      continue;
++    }
+     double u = p(i) / m_base_rate(i);
+     if (u < min_u)
+     {

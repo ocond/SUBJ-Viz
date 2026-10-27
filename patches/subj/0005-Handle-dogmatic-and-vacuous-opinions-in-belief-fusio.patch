@@ -1,0 +1,271 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 21:15:43 +0000
+Subject: [PATCH 5/8] Handle dogmatic and vacuous opinions in belief fusion
+
+Cumulative and averaging belief fusion divided by the uncertainty of
+each source (u_a / u_i), so a single dogmatic source (u = 0) turned
+the result into NaN. Averaging fusion of only vacuous opinions also
+produced a NaN base rate (0 / 0).
+
+* Compute the product of the other sources' uncertainties directly
+  instead of dividing by u_i.
+* If any source is dogmatic, return the average of the dogmatic
+  sources, the limit of both fusion operators for equally dogmatic
+  sources.
+* If all sources are vacuous, return the vacuous opinion with the
+  average base rate (cumulative fusion previously returned the first
+  opinion's base rate).
+* Compute the fused base rate from the certainty weights
+  (1 - u_i) * prod_{j != i} u_j directly, avoiding cancellation for
+  nearly vacuous sources. The result is unchanged otherwise.
+* Divide the averaging fusion uncertainty by the sum of the weights.
+  The missing division was masked so far, as updateUncertainty()
+  replaces an inconsistent uncertainty by 1 - sum(b).
+---
+ src/Operators.cpp | 179 ++++++++++++++++++++++++++++++++--------------
+ 1 file changed, 124 insertions(+), 55 deletions(-)
+
+diff --git a/src/Operators.cpp b/src/Operators.cpp
+index 55654fc..c58af6d 100644
+--- a/src/Operators.cpp
++++ b/src/Operators.cpp
+@@ -43,6 +43,101 @@
+ 
+ namespace subj {
+ 
++namespace {
++
++// Uncertainties below this threshold are treated as dogmatic, above 1 minus it as vacuous
++const double kUncertaintyEpsilon = 1e-12;
++
++// Handles the cases in which the belief fusion formulas are undefined (0 / 0). If any of the
++// opinions is dogmatic, the result is the average of the dogmatic opinions, which is the limit
++// of both cumulative and averaging belief fusion for equally dogmatic sources. If all opinions
++// are vacuous, the result is the vacuous opinion with the average base rate. Returns false if
++// the general fusion formulas can be applied.
++bool fuseDegenerateOpinions(const std::vector<MultinomialOpinion>& opinions,
++                            MultinomialOpinion& result)
++{
++  Eigen::Index dim           = opinions[0].dim();
++  Eigen::VectorXd b_dogmatic = Eigen::VectorXd::Zero(dim);
++  Eigen::VectorXd a_dogmatic = Eigen::VectorXd::Zero(dim);
++  Eigen::VectorXd a_sum      = Eigen::VectorXd::Zero(dim);
++  double dogmatic_count      = 0.0;
++  bool all_vacuous           = true;
++
++  for (const MultinomialOpinion& o : opinions)
++  {
++    if (o.u() < kUncertaintyEpsilon)
++    {
++      b_dogmatic += o.bMat();
++      a_dogmatic += o.aMat();
++      dogmatic_count += 1.0;
++    }
++    if (o.u() <= 1.0 - kUncertaintyEpsilon)
++    {
++      all_vacuous = false;
++    }
++    a_sum += o.aMat();
++  }
++
++  if (dogmatic_count > 0.0)
++  {
++    result.b(b_dogmatic / dogmatic_count);
++    result.u(0.0);
++    result.a(a_dogmatic / dogmatic_count);
++    return true;
++  }
++
++  if (all_vacuous)
++  {
++    result.b(Eigen::VectorXd::Zero(dim));
++    result.u(1.0);
++    result.a(a_sum / static_cast<double>(opinions.size()));
++    return true;
++  }
++
++  return false;
++}
++
++// Returns, for every opinion, the product of the uncertainties of all other opinions
++Eigen::VectorXd otherUncertaintyProducts(const std::vector<MultinomialOpinion>& opinions)
++{
++  Eigen::Index size = static_cast<Eigen::Index>(opinions.size());
++  Eigen::VectorXd u_t = Eigen::VectorXd::Ones(size);
++
++  for (Eigen::Index i = 0; i < size; ++i)
++  {
++    for (Eigen::Index j = 0; j < size; ++j)
++    {
++      if (i != j)
++      {
++        u_t[i] *= opinions[static_cast<size_t>(j)].u();
++      }
++    }
++  }
++
++  return u_t;
++}
++
++// Base rate of the fused opinion: the base rates of the sources weighted by their certainty
++// (1 - u_i) times the product of the uncertainties of all other sources
++Eigen::VectorXd fusedBaseRate(const std::vector<MultinomialOpinion>& opinions,
++                              const Eigen::VectorXd& u_t)
++{
++  Eigen::VectorXd a = Eigen::VectorXd::Zero(opinions[0].dim());
++  double weight_sum = 0.0;
++
++  for (Eigen::Index i = 0; i < u_t.size(); ++i)
++  {
++    const MultinomialOpinion& o = opinions[static_cast<size_t>(i)];
++    double weight               = (1.0 - o.u()) * u_t[i];
++    a += weight * o.aMat();
++    weight_sum += weight;
++  }
++
++  return a / weight_sum;
++}
++
++} // namespace
++
+ double projectedDistance(const MultinomialOpinion& a, const MultinomialOpinion& b)
+ {
+   return (a.projectionMat() - b.projectionMat()).cwiseAbs().sum() / 2.0;
+@@ -75,7 +170,6 @@ double doc(const MultinomialOpinion& a, const MultinomialOpinion& b)
+ 
+ MultinomialOpinion averagingBeliefFusion(const std::vector<MultinomialOpinion>& opinions)
+ {
+-  // TODO check preconditions, handle special cases
+   if (opinions.size() < 2)
+   {
+     throw std::invalid_argument("At least 2 opinions must be given!");
+@@ -92,35 +186,30 @@ MultinomialOpinion averagingBeliefFusion(const std::vector<MultinomialOpinion>&
+     }
+   }
+ 
+-  Eigen::VectorXd u_t(size);
+-  double u_a = 1.0;
+-  Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> b_mat(dim, size);
+-  Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> a_mat(dim, size);
+-
+-  for (const MultinomialOpinion& o : opinions)
++  if (!(size <= static_cast<size_t>(std::numeric_limits<Eigen::Index>::max())))
+   {
+-    u_a *= o.u();
++    throw std::runtime_error("Too many opinions given!");
+   }
+ 
+-  if (!(size <= static_cast<size_t>(std::numeric_limits<Eigen::Index>::max())))
++  MultinomialOpinion op(dim);
++  if (fuseDegenerateOpinions(opinions, op))
+   {
+-    // TODO consider throwing an exception
+-    return MultinomialOpinion(2);
++    return op;
+   }
+ 
++  Eigen::VectorXd u_t = otherUncertaintyProducts(opinions);
++  double u_a          = 1.0;
++  Eigen::VectorXd b   = Eigen::VectorXd::Zero(dim);
++
+   for (Eigen::Index i = 0; i < static_cast<Eigen::Index>(size); ++i)
+   {
+-    u_t[i]       = u_a / opinions[i].u();
+-    b_mat.col(i) = opinions[i].bMat();
+-    a_mat.col(i) = opinions[i].aMat();
++    u_a *= opinions[static_cast<size_t>(i)].u();
++    b += u_t[i] * opinions[static_cast<size_t>(i)].bMat();
+   }
+ 
+-  MultinomialOpinion op(dim);
+-  op.b((b_mat.array().rowwise() * u_t.transpose().array()).rowwise().sum() / u_t.sum());
+-  op.u(static_cast<double>(size) * u_a);
+-  op.a(((a_mat.array().rowwise() * u_t.transpose().array()).rowwise().sum() -
+-        (a_mat.array() * u_a).rowwise().sum()) /
+-       (u_t.sum() - static_cast<double>(size) * u_a));
++  op.b(b / u_t.sum());
++  op.u(static_cast<double>(size) * u_a / u_t.sum());
++  op.a(fusedBaseRate(opinions, u_t));
+   return op;
+ }
+ 
+@@ -131,26 +220,11 @@ MultinomialOpinion abf(const std::vector<MultinomialOpinion>& opinions)
+ 
+ MultinomialOpinion aleatoryCumulativeBeliefFusion(const std::vector<MultinomialOpinion>& opinions)
+ {
+-  // TODO check preconditions, handle special cases
+   if (opinions.size() < 2)
+   {
+     throw std::runtime_error("At least 2 opinions must be given!");
+   }
+ 
+-  bool all_vacuous = true;
+-  for (const MultinomialOpinion& o : opinions)
+-  {
+-    if (o.u() != 1.0)
+-    {
+-      all_vacuous = false;
+-      break;
+-    }
+-  }
+-  if (all_vacuous)
+-  {
+-    return opinions[0];
+-  }
+-
+   size_t size      = opinions.size();
+   Eigen::Index dim = opinions[0].dim();
+ 
+@@ -162,36 +236,31 @@ MultinomialOpinion aleatoryCumulativeBeliefFusion(const std::vector<MultinomialO
+     }
+   }
+ 
+-  Eigen::VectorXd u_t(size);
+-  double u_a = 1.0;
+-  Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> b_mat(dim, size);
+-  Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> a_mat(dim, size);
+-
+-  for (const MultinomialOpinion& o : opinions)
++  if (!(size <= static_cast<size_t>(std::numeric_limits<Eigen::Index>::max())))
+   {
+-    u_a *= o.u();
++    throw std::runtime_error("Too many opinions given!");
+   }
+ 
+-  if (!(size <= static_cast<size_t>(std::numeric_limits<Eigen::Index>::max())))
++  MultinomialOpinion op(dim);
++  if (fuseDegenerateOpinions(opinions, op))
+   {
+-    // TODO consider throwing an exception
+-    throw std::runtime_error("Too many opinions given!");
++    return op;
+   }
+ 
++  Eigen::VectorXd u_t = otherUncertaintyProducts(opinions);
++  double u_a          = 1.0;
++  Eigen::VectorXd b   = Eigen::VectorXd::Zero(dim);
++
+   for (Eigen::Index i = 0; i < static_cast<Eigen::Index>(size); ++i)
+   {
+-    u_t[i]       = u_a / opinions[i].u();
+-    b_mat.col(i) = opinions[i].bMat();
+-    a_mat.col(i) = opinions[i].aMat();
++    u_a *= opinions[static_cast<size_t>(i)].u();
++    b += u_t[i] * opinions[static_cast<size_t>(i)].bMat();
+   }
+ 
+-  MultinomialOpinion op(dim);
+-  op.b((b_mat.array().rowwise() * u_t.transpose().array()).rowwise().sum() /
+-       (u_t.sum() - (static_cast<double>(size) - 1) * u_a));
+-  op.u(u_a / (u_t.sum() - (static_cast<double>(size) - 1) * u_a));
+-  op.a(((a_mat.array().rowwise() * u_t.transpose().array()).rowwise().sum() -
+-        (a_mat.array() * u_a).rowwise().sum()) /
+-       (u_t.sum() - static_cast<double>(size) * u_a));
++  double denominator = u_t.sum() - (static_cast<double>(size) - 1) * u_a;
++  op.b(b / denominator);
++  op.u(u_a / denominator);
++  op.a(fusedBaseRate(opinions, u_t));
+   return op;
+ }
+ 

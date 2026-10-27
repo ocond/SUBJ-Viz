@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 21:14:01 +0000
+Subject: [PATCH 3/8] Keep prior weight consistent between opinions and
+ Dirichlet PDFs
+
+MultinomialOpinion uses a non-informative prior weight W equal to its
+dimension and derives the evidence r = W b / u from it, but the
+DirichletPDF it returns always used W = 2 to compute the strength
+alpha = r + W a. For opinions with more than two dimensions the PDF
+therefore did not match the opinion; e.g. the vacuous trinomial opinion
+with uniform base rate yielded Dir(2/3, 2/3, 2/3) instead of the
+uniform Dir(1, 1, 1), and the PDF mean differed from the projected
+probability.
+
+Store the prior weight in DirichletPDF (default stays 2), pass the
+opinion's prior weight on in dirichletPdf() and use the PDF's prior
+weight when updating an opinion from a PDF, so the conversion is
+lossless in both directions. Expose the new accessors in pySUBJ.
+---
+ include/subj/DirichletPDF.h |  4 ++++
+ src/DirichletPDF.cpp        | 10 ++++++++++
+ src/MultinomialOpinion.cpp  |  4 ++--
+ src/SubjPythonBindings.cpp  |  6 ++++++
+ 4 files changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/include/subj/DirichletPDF.h b/include/subj/DirichletPDF.h
+index 3fed187..477c5e0 100644
+--- a/include/subj/DirichletPDF.h
++++ b/include/subj/DirichletPDF.h
+@@ -64,6 +64,10 @@ public:
+   std::vector<double> baseRate() const;
+   Eigen::VectorXd baseRateMat() const;
+ 
++  void updatePriorWeight(double prior_weight);
++
++  double priorWeight() const;
++
+   std::vector<double> strength() const;
+   Eigen::VectorXd strengthMat() const;
+ 
+diff --git a/src/DirichletPDF.cpp b/src/DirichletPDF.cpp
+index ba67b80..38435f3 100644
+--- a/src/DirichletPDF.cpp
++++ b/src/DirichletPDF.cpp
+@@ -99,6 +99,16 @@ Eigen::VectorXd DirichletPDF::baseRateMat() const
+   return m_base_rate;
+ }
+ 
++void DirichletPDF::updatePriorWeight(double prior_weight)
++{
++  m_prior_weight = prior_weight;
++}
++
++double DirichletPDF::priorWeight() const
++{
++  return m_prior_weight;
++}
++
+ std::vector<double> DirichletPDF::strength() const
+ {
+   Eigen::VectorXd strength_vec = m_evidence + m_base_rate * m_prior_weight;
+diff --git a/src/MultinomialOpinion.cpp b/src/MultinomialOpinion.cpp
+index 0bd691f..1d6f116 100644
+--- a/src/MultinomialOpinion.cpp
++++ b/src/MultinomialOpinion.cpp
+@@ -321,6 +321,7 @@ DirichletPDF MultinomialOpinion::dirichletPdf() const
+ 
+   dp.updateEvidence(r);
+   dp.updateBaseRate(m_base_rate);
++  dp.updatePriorWeight(m_prior_weight);
+ 
+   return dp;
+ }
+@@ -335,8 +336,7 @@ void MultinomialOpinion::update(DirichletPDF& pdf)
+   Eigen::VectorXd evidMat = pdf.evidenceMat();
+   double evidence_sum     = evidMat.sum();
+   m_base_rate             = pdf.baseRateMat();
+-  m_prior_weight =
+-    static_cast<double>(m_base_rate.rows()); // TODO handle loss of precision for large values
++  m_prior_weight          = pdf.priorWeight();
+   m_belief      = evidMat / (m_prior_weight + evidence_sum);
+   m_dim         = m_belief.rows();
+   m_uncertainty = m_prior_weight / (m_prior_weight + evidence_sum);
+diff --git a/src/SubjPythonBindings.cpp b/src/SubjPythonBindings.cpp
+index 296967d..e2369dd 100644
+--- a/src/SubjPythonBindings.cpp
++++ b/src/SubjPythonBindings.cpp
+@@ -51,6 +51,12 @@ PYBIND11_MODULE(pysubj, m)
+     .def("baseRateMat",
+          &subj::DirichletPDF::baseRate,
+          "Return the dirichlet pdf's base rate as numpy array.")
++    .def("updatePriorWeight",
++         &subj::DirichletPDF::updatePriorWeight,
++         "Update the dirichlet pdf's non-informative prior weight.")
++    .def("priorWeight",
++         &subj::DirichletPDF::priorWeight,
++         "Return the dirichlet pdf's non-informative prior weight.")
+     .def("strength", &subj::DirichletPDF::strength, "Return the dirichlet pdf's strength.")
+     .def("strengthMat",
+          &subj::DirichletPDF::strength,

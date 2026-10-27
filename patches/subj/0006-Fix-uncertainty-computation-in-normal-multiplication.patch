@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 21:16:13 +0000
+Subject: [PATCH 6/8] Fix uncertainty computation in normal multiplication
+
+The line computing the candidate uncertainties (P(xy) - b_x b_y) / a(xy)
+was commented out, so minCoeff() was called on an empty matrix, which
+crashes (segmentation fault in release builds).
+
+Compute the uncertainty as the minimum of the candidates over all
+elements of the product domain with a non-zero base rate. This is the
+largest uncertainty for which the belief masses P(xy) - a(xy) u of the
+product stay above the singleton products b_x b_y, so the result is a
+valid opinion whose projected probabilities are P(x) P(y).
+---
+ src/Operators.cpp | 19 +++++++++++++++----
+ 1 file changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/src/Operators.cpp b/src/Operators.cpp
+index c58af6d..201138d 100644
+--- a/src/Operators.cpp
++++ b/src/Operators.cpp
+@@ -37,6 +37,7 @@
+ #include <subj/Operators.h>
+ 
+ #include <Eigen/Dense>
++#include <algorithm>
+ #include <limits>
+ #include <stdexcept>
+ #include <vector>
+@@ -338,10 +339,20 @@ MultinomialOpinion normalMultiplication(const MultinomialOpinion& opinion1,
+   Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> p_prod;
+   p_prod = (b_1 + a_1 * u_1) * (b_2 + a_2 * u_2).transpose();
+ 
+-  Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> u_all;
+-  //u_all    = (p_prod - b_single).array() / a.array();
+-  u_all    = (u_all.array().isNaN()).select(std::numeric_limits<double>::max(), u_all);
+-  double u = u_all.minCoeff();
++  // The uncertainty is the largest one for which no belief mass of the product falls below the
++  // product of the singleton beliefs. Elements without base rate do not constrain it.
++  double u = 1.0;
++  for (Eigen::Index i = 0; i < a.rows(); ++i)
++  {
++    for (Eigen::Index j = 0; j < a.cols(); ++j)
++    {
++      if (a(i, j) > 0.0)
++      {
++        u = std::min(u, (p_prod(i, j) - b_single(i, j)) / a(i, j));
++      }
++    }
++  }
++  u = std::max(u, 0.0);
+ 
+   Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> b;
+   b = p_prod - a * u;
