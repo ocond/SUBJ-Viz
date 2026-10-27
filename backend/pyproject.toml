@@ -6,7 +6,6 @@ build-backend = "setuptools.build_meta"
 name = "subjviz"
 version = "0.1.0"
 description = "Interactive visualizer for subjective logic operators, computed with SUBJ"
-readme = "../README.md"
 requires-python = ">=3.9"
 # pysubj is not on PyPI; build it with scripts/build_pysubj.sh
 dependencies = [

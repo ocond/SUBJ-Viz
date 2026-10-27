@@ -49,7 +49,9 @@ export function OpinionTable({ entries, labels, caption }: { entries: TableEntry
             <tr className="group-start">
               <th scope="row">valid</th>
               {entries.map((entry) => (
-                <td key={entry.label}>{entry.analysis ? (entry.analysis.valid ? "yes" : "no") : "…"}</td>
+                <td key={entry.label} className="numeric">
+                  {entry.analysis ? (entry.analysis.valid ? "yes" : "no") : "…"}
+                </td>
               ))}
             </tr>
           )}

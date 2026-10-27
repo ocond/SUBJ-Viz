@@ -30,6 +30,7 @@ function NumberInput({
   disabled?: boolean;
 }) {
   const [draft, setDraft] = useState<string | null>(null);
+  if (disabled) return <span className="numeric">{format(value)}</span>;
   const commit = () => {
     if (draft === null) return;
     const v = Number(draft);
@@ -44,7 +45,6 @@ function NumberInput({
       max={1}
       step={0.01}
       aria-label={label}
-      disabled={disabled}
       value={draft ?? format(value)}
       onChange={(e) => setDraft(e.target.value)}
       onBlur={commit}

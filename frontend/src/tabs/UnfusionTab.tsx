@@ -138,10 +138,11 @@ export function UnfusionTab() {
             <OpinionTable
               caption="Fused, contributing and unfused opinions"
               labels={labels}
-              entries={[
-                ...entries,
-                { label: "ω^A⊕B_X", color: MUTED, shape: "ring" as const, analysis: current?.refused },
-              ]}
+              entries={
+                current?.refused
+                  ? [...entries, { label: "ω^A⊕B_X", color: MUTED, shape: "ring" as const, analysis: current.refused }]
+                  : entries
+              }
             />
           </Card>
           <Card title="Probability density">
